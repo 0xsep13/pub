@@ -1,0 +1,55 @@
+name: Variable Scope & Precedence Demo
+
+on:
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+# 1. WORKFLOW-LEVEL ENV: Available to all jobs and steps
+env:
+  WORKFLOW_LEVEL_ENV: "Set at Workflow Root"
+  OVERRIDE_TEST: "1-Workflow-Level"
+
+jobs:
+  variable-Playground:
+    runs-on: ubuntu-latest
+    
+    # Attaching an environment unlocks Environment Variables configured in the GitHub UI.
+    # If 'MY_CONFIG_VAR' exists in both Repo Variables and the 'dev' Environment, 'dev' wins.
+    environment: dev
+
+    # 2. JOB-LEVEL ENV: Overrides workflow-level env for this job
+    env:
+      JOB_LEVEL_ENV: "Set at Job Level"
+      OVERRIDE_TEST: "2-Job-Level"
+      # Map a GitHub UI Configuration Variable (vars) into a shell Environment Variable (env)
+      CONFIG_FROM_UI: ${{ vars.MY_CONFIG_VAR || 'fallback-if-not-set-in-ui' }}
+
+    steps:
+      - name: Checkout Repository (Required to run local action)
+        uses: actions/checkout@v4
+
+      - name: 1. Inspect Contexts vs Shell Env
+        # 3. STEP-LEVEL ENV: Highest precedence; overrides Job and Workflow env
+        env:
+          STEP_LEVEL_ENV: "Set at Step Level"
+          OVERRIDE_TEST: "3-Step-Level"
+        run: |
+          echo "--- Configuration Variables (GitHub UI 'vars' context) ---"
+          echo "Repo-wide Variable:        ${{ vars.REPO_WIDE_VAR }}"
+          echo "Environment-scoped Var:    ${{ vars.MY_CONFIG_VAR }}"
+          echo "Mapped to Shell Env:       $CONFIG_FROM_UI"
+          echo ""
+          echo "--- Runtime Environment Variables ('env') ---"
+          echo "Workflow Level:            $WORKFLOW_LEVEL_ENV"
+          echo "Job Level:                 $JOB_LEVEL_ENV"
+          echo "Step Level:                $STEP_LEVEL_ENV"
+          echo "Precedence Winner:         $OVERRIDE_TEST"
+
+      - name: 2. Dynamically Set a Variable for Future Steps
+        run: |
+          # Write to $GITHUB_ENV to persist a variable across subsequent steps in this job
+          echo "DYNAMIC_STEP_VAR=Generated_At_$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 3. Call Local Custom Action
+        uses: ./.github/actions/inspect-vars
+        with:
+          explicit_input: ${{ vars.MY_CONFIG_VAR || 'default-input-value' }}
