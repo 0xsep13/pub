@@ -1,0 +1,258 @@
+name: Central ACA Deployment Blueprint
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target deployment environment (dev, staging, prod)'
+        required: true
+        type: string
+      app_name:
+        description: 'Target Azure Container App name'
+        required: true
+        type: string
+      resource_group:
+        description: 'Target Azure Resource Group'
+        required: true
+        type: string
+      registry_type:
+        description: 'Source registry type: acr | ecr | nexus'
+        required: true
+        type: string
+      registry_server:
+        description: 'Registry FQDN (e.g., myacr.azurecr.io, 123456.dkr.ecr.ap-southeast-1.amazonaws.com, nexus.corp.internal:8082)'
+        required: true
+        type: string
+      image_repository:
+        description: 'Image path/name (e.g., backend/payment-service)'
+        required: true
+        type: string
+      image_tag:
+        description: 'Immutable image tag or SHA'
+        required: true
+        type: string
+      cpu_cores:
+        description: 'Allocated CPU cores (Governance bounded)'
+        required: false
+        type: string
+        default: '0.5'
+      memory_size:
+        description: 'Allocated Memory (Governance bounded)'
+        required: false
+        type: string
+        default: '1.0Gi'
+      aws_region:
+        description: 'AWS Region (Required if registry_type == ecr)'
+        required: false
+        type: string
+        default: 'ap-southeast-1'
+      keyvault_nexus_secret_uri:
+        description: 'Key Vault Secret URI for Nexus password (Required if registry_type == nexus)'
+        required: false
+        type: string
+        default: ''
+      nexus_username:
+        description: 'Nexus service account username'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      AWS_ROLE_ARN:
+        required: false
+      NEXUS_READ_TOKEN:
+        required: false
+
+permissions:
+  id-token: write   # Required for Azure & AWS OIDC
+  contents: read
+  security-events: write # For uploading Trivy SARIF to GitHub Advanced Security
+
+jobs:
+  governance_and_security_gate:
+    name: Governance & Supply Chain Gate
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.resolve_digest.outputs.digest }}
+    steps:
+      - name: 1. Policy Gate - Block Mutable Tags & Validate Quota
+        run: |
+          if [[ "${{ inputs.image_tag }}" == "latest" || "${{ inputs.image_tag }}" == "main" || "${{ inputs.image_tag }}" == "master" ]]; then
+            echo "::error::Governance Violation: Mutable tags ('latest', 'main') are prohibited. Use immutable semantic versions or Git SHA."
+            exit 1
+          fi
+          
+          # Enforce valid ACA CPU/Memory combinations
+          ALLOWED_CPUS=("0.25" "0.5" "0.75" "1.0" "1.25" "1.5" "1.75" "2.0")
+          if [[ ! " ${ALLOWED_CPUS[*]} " =~ " ${{ inputs.cpu_cores }} " ]]; then
+            echo "::error::Governance Violation: CPU cores (${{ inputs.cpu_cores }}) outside standard platform tier."
+            exit 1
+          fi
+
+      - name: 2a. Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 2b. Authenticate to Registry (ACR / ECR / Nexus)
+        run: |
+          case "${{ inputs.registry_type }}" in
+            acr)
+              az acr login --name "${{ inputs.registry_server }}"
+              ;;
+            ecr)
+              if [ -z "${{ secrets.AWS_ROLE_ARN }}" ]; then
+                echo "::error::AWS_ROLE_ARN is required for ECR deployments."
+                exit 1
+              fi
+              ;;
+            nexus)
+              echo "${{ secrets.NEXUS_READ_TOKEN }}" | docker login "${{ inputs.registry_server }}" -u "${{ inputs.nexus_username }}" --password-stdin
+              ;;
+            *)
+              echo "::error::Unsupported registry_type: ${{ inputs.registry_type }}"
+              exit 1
+              ;;
+          esac
+
+      - name: 2c. AWS OIDC Login (Conditional for ECR)
+        if: inputs.registry_type == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: 2d. Docker Login to ECR (Conditional for ECR)
+        if: inputs.registry_type == 'ecr'
+        run: |
+          aws ecr get-login-password --region "${{ inputs.aws_region }}" | \
+            docker login --username AWS --password-stdin "${{ inputs.registry_server }}"
+
+      - name: 3. Resolve Immutable Image Digest (SHA256)
+        id: resolve_digest
+        run: |
+          FULL_IMAGE="${{ inputs.registry_server }}/${{ inputs.image_repository }}:${{ inputs.image_tag }}"
+          DIGEST=$(docker buildx imagetools inspect "$FULL_IMAGE" --format "{{json .Manifest}}" | jq -r .digest)
+          if [ -z "$DIGEST" ] || [ "$DIGEST" == "null" ]; then
+            echo "::error::Failed to resolve immutable digest for $FULL_IMAGE"
+            exit 1
+          fi
+          echo "Resolved Digest: $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: 4. Vulnerability Scanning (Trivy Gate)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ inputs.registry_server }}/${{ inputs.image_repository }}@${{ steps.resolve_digest.outputs.digest }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: 5. Upload Scan Results to GHAS
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy_aca:
+    name: Deploy to Azure Container Apps
+    needs: governance_and_security_gate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS OIDC Login (If ECR Direct Pull)
+        if: inputs.registry_type == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Configure ACA Registry Credentials
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          
+          # Fetch User-Assigned Managed Identity attached to the ACA
+          UAMI_ID=$(az containerapp show \
+            --name "${{ inputs.app_name }}" \
+            --resource-group "${{ inputs.resource_group }}" \
+            --query "identity.userAssignedIdentities | keys(@)[0]" -o tsv)
+
+          case "${{ inputs.registry_type }}" in
+            acr)
+              echo "Configuring Managed Identity pull for ACR..."
+              az containerapp registry set \
+                --name "${{ inputs.app_name }}" \
+                --resource-group "${{ inputs.resource_group }}" \
+                --server "${{ inputs.registry_server }}" \
+                --identity "$UAMI_ID"
+              ;;
+            nexus)
+              echo "Configuring Key Vault backed secret pull for Nexus..."
+              az containerapp secret set \
+                --name "${{ inputs.app_name }}" \
+                --resource-group "${{ inputs.resource_group }}" \
+                --secrets "nexus-pwd=keyvaultref:${{ inputs.keyvault_nexus_secret_uri }},identityref:$UAMI_ID"
+              
+              az containerapp registry set \
+                --name "${{ inputs.app_name }}" \
+                --resource-group "${{ inputs.resource_group }}" \
+                --server "${{ inputs.registry_server }}" \
+                --username "${{ inputs.nexus_username }}" \
+                --password-secret-ref "nexus-pwd"
+              ;;
+            ecr)
+              echo "Generating short-lived ECR token & binding to ACA..."
+              ECR_TOKEN=$(aws ecr get-login-password --region "${{ inputs.aws_region }}")
+              az containerapp registry set \
+                --name "${{ inputs.app_name }}" \
+                --resource-group "${{ inputs.resource_group }}" \
+                --server "${{ inputs.registry_server }}" \
+                --username "AWS" \
+                --password "$ECR_TOKEN"
+              ;;
+          esac
+
+      - name: Deploy Immutable Revision by Digest
+        run: |
+          IMMUTABLE_IMAGE="${{ inputs.registry_server }}/${{ inputs.image_repository }}@${{ needs.governance_and_security_gate.outputs.image_digest }}"
+          REVISION_SUFFIX="rev-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          echo "Deploying $IMMUTABLE_IMAGE with suffix $REVISION_SUFFIX..."
+          az containerapp update \
+            --name "${{ inputs.app_name }}" \
+            --resource-group "${{ inputs.resource_group }}" \
+            --image "$IMMUTABLE_IMAGE" \
+            --cpu "${{ inputs.cpu_cores }}" \
+            --memory "${{ inputs.memory_size }}" \
+            --revision-suffix "$REVISION_SUFFIX"
+
+      - name: Verify Revision Health & Provisioning State
+        run: |
+          REVISION_NAME="${{ inputs.app_name }}--rev-${{ github.run_id }}-${{ github.run_attempt }}"
+          STATUS=$(az containerapp revision show \
+            --name "${{ inputs.app_name }}" \
+            --resource-group "${{ inputs.resource_group }}" \
+            --revision "$REVISION_NAME" \
+            --query "properties.runningState" -o tsv)
+          
+          echo "Current Revision State: $STATUS"
+          if [[ "$STATUS" == "Failed" || "$STATUS" == "Degraded" ]]; then
+            echo "::error::Deployment failed health verification. State: $STATUS"
+            exit 1
+          fi
