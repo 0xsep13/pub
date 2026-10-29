@@ -5,6 +5,10 @@ inputs:
   explicit_input:
     description: 'Variable passed explicitly via with:'
     required: true
+  repo_wide_var:
+    description: 'Repo variable passed from workflow context into action input'
+    required: false
+    default: 'not-set'
 
 runs:
   using: 'composite'
@@ -12,11 +16,13 @@ runs:
     - name: Read Variables Inside Action
       shell: bash
       env:
-        # Map the action input to a local shell environment variable (Best Practice)
+        # Map action inputs to local shell environment variables
         MAPPED_INPUT_ENV: ${{ inputs.explicit_input }}
+        MAPPED_REPO_VAR: ${{ inputs.repo_wide_var }}
       run: |
         echo "--- Inside Custom Composite Action ---"
-        echo "1. Passed via input (mapped to env): $MAPPED_INPUT_ENV"
-        echo "2. Inherited from Job/Workflow env:  $WORKFLOW_LEVEL_ENV"
-        echo "3. Dynamic var from GITHUB_ENV:      $DYNAMIC_STEP_VAR"
-        echo "4. Direct repo var context access:   ${{ vars.REPO_WIDE_VAR }}"
+        echo "1. Passed via input (explicit_input): $MAPPED_INPUT_ENV"
+        echo "2. Passed via input (repo_wide_var):  $MAPPED_REPO_VAR"
+        echo "3. Passed via caller step env:        $STEP_PASSED_REPO_VAR"
+        echo "4. Inherited from Job/Workflow env:   $WORKFLOW_LEVEL_ENV"
+        echo "5. Dynamic var from GITHUB_ENV:       $DYNAMIC_STEP_VAR"
