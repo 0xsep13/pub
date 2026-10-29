@@ -2,6 +2,15 @@ name: Variable Scope & Precedence Demo
 
 on:
   workflow_dispatch: # Allows manual trigger from the Actions tab
+    inputs:
+      target_env:
+         description: 'Select the target environment to deploy/inspect'
+         required: true
+         default: 'dev'
+         type: choice
+         options:
+           - dev
+           - uat
 
 # 1. WORKFLOW-LEVEL ENV: Available to all jobs and steps
 env:
@@ -14,7 +23,7 @@ jobs:
     
     # Attaching an environment unlocks Environment Variables configured in the GitHub UI.
     # If 'MY_CONFIG_VAR' exists in both Repo Variables and the 'dev' Environment, 'dev' wins.
-    environment: dev
+    environment: ${{ inputs.target_env }}
 
     # 2. JOB-LEVEL ENV: Overrides workflow-level env for this job
     env:
