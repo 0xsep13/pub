@@ -51,5 +51,10 @@ jobs:
 
       - name: 3. Call Local Custom Action
         uses: ./.github/actions/inspect-vars
+        # Method A: Inject into the step's shell environment
+        env:
+          STEP_PASSED_REPO_VAR: ${{ vars.REPO_WIDE_VAR || 'default-step-env' }}
+        # Method B (Best Practice): Pass explicitly via action inputs
         with:
           explicit_input: ${{ vars.MY_CONFIG_VAR || 'default-input-value' }}
+          repo_wide_var: ${{ vars.REPO_WIDE_VAR || 'default-repo-var' }}
